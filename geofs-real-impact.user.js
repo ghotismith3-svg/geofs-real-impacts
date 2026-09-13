@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFS Real Impact — Precision Crash Detection
 // @namespace    https://www.geo-fs.com/geofs.php?v=4
-// @version      2.3.0
-// @description  Forces a real crash (engine cutout + forced loss of control) only when you actually hit a real detected obstacle -- a real tree or a real building at your exact position. Runways, open fields, and water remain safe even at very low altitude. Uses geofsRealTrees for tree detection (trees are invisible to every standard Cesium picking API) and terrain sampling for buildings.
+// @version      2.4.0
+// @description  Forces a real crash (engine cutout + forced loss of control) only when you actually hit a real detected obstacle -- a real tree or a real building at your exact position. Runways, open fields, and water remain safe even at very low altitude. Uses geofsRealTrees for tree detection (trees are invisible to every standard Cesium picking API) and terrain sampling for buildings. v2.4: panel settings now persist across reloads (localStorage).
 // @author       yasseristaken
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
@@ -28,7 +28,7 @@
   let resetFlightHooked = false;
   let lastCrashedState = false;
 
-  const settings = {
+  const DEFAULTS = Object.freeze({
     enabled: true,
     minAltitudeFt: 80, // tuned to 80ft after real flight testing (150 felt
                          // too sensitive; 80 is a reasonable middle ground
@@ -46,7 +46,39 @@
     sampleOffsetM: 8,
     cooldownMs: 3000,
     spawnGraceMs: 4000
-  };
+  });
+
+  const settings = { ...DEFAULTS };
+
+  // ============================================================
+  // 0.1 PERSISTENCE (localStorage) — panel settings survive page reloads
+  // ============================================================
+  const STORAGE_KEY = "geofs-real-impact-settings";
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      // Only copy over keys we actually know about, so old/corrupt
+      // saved data can't inject unexpected properties.
+      Object.keys(DEFAULTS).forEach((key) => {
+        if (key in saved) settings[key] = saved[key];
+      });
+    } catch (e) {
+      console.warn("[Real Impact] Failed to load saved settings:", e);
+    }
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    } catch (e) {
+      console.warn("[Real Impact] Failed to save settings:", e);
+    }
+  }
+
+  loadSettings(); // apply any saved values immediately, before anything below uses "settings"
 
   function getCesium() {
     return window.Cesium || (window.geofs?.api?.Cesium) || null;
@@ -281,6 +313,7 @@
       }
       #cur-panel .toggle-btn { background: linear-gradient(135deg,#a01f1f,#5a0f0f); color: #fff; }
       #cur-panel .reset-btn { background: rgba(255,255,255,0.1); color: #ddd; }
+      #cur-panel .defaults-btn { background: rgba(255,255,255,0.1); color: #ddd; }
       #cur-panel .status-line {
         margin-top: 10px; padding: 6px 8px; background: rgba(0,0,0,0.25);
         border-radius: 6px; font-size: 11px; color: #cabfbf;
@@ -294,7 +327,7 @@
       ? "✅ Tree extractor connected"
       : "⚠️ Tree extractor NOT detected (only buildings are active)";
     panel.innerHTML = `
-      <div class="title">💥 GeoFS Real Impact v2.3</div>
+      <div class="title">💥 GeoFS Real Impact v2.4</div>
       <label>Max altitude to count as impact (ft, above bare terrain) <span class="val" id="cur-a-val">${settings.minAltitudeFt}</span></label>
       <input type="range" id="cur-alt" min="15" max="300" step="5" value="${settings.minAltitudeFt}">
       <label>Min speed to arm the crash check (kts) <span class="val" id="cur-s-val">${settings.minSpeedKts}</span></label>
@@ -307,6 +340,7 @@
       <input type="range" id="cur-offset" min="2" max="20" step="1" value="${settings.sampleOffsetM}">
       <button class="toggle-btn" id="cur-toggle">${settings.enabled ? "Disable" : "Enable"}</button>
       <button class="reset-btn" id="cur-reset">Force end of fall mode (debug)</button>
+      <button class="defaults-btn" id="cur-defaults">↺ Restore default values</button>
       <div class="status-line">${treesStatus}</div>
     `;
     document.body.appendChild(panel);
@@ -314,28 +348,42 @@
     panel.querySelector("#cur-alt").oninput = function () {
       settings.minAltitudeFt = parseFloat(this.value);
       panel.querySelector("#cur-a-val").textContent = this.value;
+      saveSettings();
     };
     panel.querySelector("#cur-speed").oninput = function () {
       settings.minSpeedKts = parseFloat(this.value);
       panel.querySelector("#cur-s-val").textContent = this.value;
+      saveSettings();
     };
     panel.querySelector("#cur-height").oninput = function () {
       settings.objectHeightThresholdM = parseFloat(this.value);
       panel.querySelector("#cur-h-val").textContent = this.value;
+      saveSettings();
     };
     panel.querySelector("#cur-tree").oninput = function () {
       settings.treeRadiusM = parseFloat(this.value);
       panel.querySelector("#cur-t-val").textContent = this.value;
+      saveSettings();
     };
     panel.querySelector("#cur-offset").oninput = function () {
       settings.sampleOffsetM = parseFloat(this.value);
       panel.querySelector("#cur-o-val").textContent = this.value;
+      saveSettings();
     };
     panel.querySelector("#cur-toggle").onclick = function () {
       settings.enabled = !settings.enabled;
       this.textContent = settings.enabled ? "Disable" : "Enable";
+      saveSettings();
     };
     panel.querySelector("#cur-reset").onclick = stopForcedFall;
+    panel.querySelector("#cur-defaults").onclick = function () {
+      Object.assign(settings, DEFAULTS);
+      saveSettings();
+      console.log("↺ [Real Impact] Values restored to defaults.");
+      panel.remove();
+      panel = null;
+      showPanel();
+    };
   }
 
   document.addEventListener("keydown", (e) => {
@@ -361,7 +409,7 @@
 
     setInterval(mainLoop, 200);
     const treesReady = typeof window.geofsRealTrees?.isTreeNear === "function";
-    console.log(`[Real Impact] 💥 v2.3 ready. Tree detection: ${treesReady ? "active" : "NOT available (install GeoFS Real Tree Positions Extractor)"}. Press ] to open the console.`);
+    console.log(`[Real Impact] 💥 v2.4 ready. Tree detection: ${treesReady ? "active" : "NOT available (install GeoFS Real Tree Positions Extractor)"}. Press ] to open the console.`);
   }
 
   let attempts = 0;
