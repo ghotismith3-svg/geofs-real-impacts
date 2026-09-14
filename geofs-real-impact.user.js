@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFS Real Impact — Precision Crash Detection
 // @namespace    https://www.geo-fs.com/geofs.php?v=4
-// @version      2.4.0
-// @description  Forces a real crash (engine cutout + forced loss of control) only when you actually hit a real detected obstacle -- a real tree or a real building at your exact position. Runways, open fields, and water remain safe even at very low altitude. Uses geofsRealTrees for tree detection (trees are invisible to every standard Cesium picking API) and terrain sampling for buildings. v2.4: panel settings now persist across reloads (localStorage).
+// @version      3.4.2
+// @description  Forces a real crash (engine cutout + forced loss of control) only when you actually hit a real detected obstacle -- a real tree or a real building at your exact position. Uses geofsRealTrees with cylinder collision support and terrain sampling for buildings. v3.4.2: Quiet & optimized console logging (clean crash banner, debugLogs toggle in panel/API) + universal altitude ceiling + Exit button.
 // @author       yasseristaken
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
@@ -30,28 +30,25 @@
 
   const DEFAULTS = Object.freeze({
     enabled: true,
-    minAltitudeFt: 80, // tuned to 80ft after real flight testing (150 felt
-                         // too sensitive; 80 is a reasonable middle ground
-                         // for typical tree canopy height without firing
-                         // during normal cruise flight)
+    minAltitudeFt: 120, // Nudged from 80 -> 120ft to comfortably cover tall 30-35m tree canopies without cruise false alerts
+    buildingMaxAltitudeFt: 3300,
     minSpeedKts: 15,
-    objectHeightThresholdM: 2.5, // threshold for sampleHeight-based detection (buildings)
-    treeRadiusM: 10.5,            // FIX v2.2: radius (meters) to consider
-                                   // "there's a real tree here" via geofsRealTrees.
-                                   // Trees aren't detectable via
-                                   // sampleHeight/pick/pickPosition -- confirmed
-                                   // with three separate tests that GeoFS
-                                   // renders them completely outside Cesium's
-                                   // standard pipeline.
+    objectHeightThresholdM: 4,
+    buildingsEnabled: true,
+    treeRadiusM: 13.5,            // Horizontal radius for tree canopy/trunk collision
+    treeCanopyHeightM: 32,        // FIX v3.4: Vertical tree canopy height (meters) passed to Extractor v1.9.0
     sampleOffsetM: 8,
+    buildingConfirmChecks: 2,
+    buildingVerticalMarginM: 2,
     cooldownMs: 3000,
-    spawnGraceMs: 4000
+    spawnGraceMs: 4000,
+    debugLogs: false              // Clean, quiet console by default
   });
 
   const settings = { ...DEFAULTS };
 
   // ============================================================
-  // 0.1 PERSISTENCE (localStorage) — panel settings survive page reloads
+  // 0.1 PERSISTENCE (localStorage)
   // ============================================================
   const STORAGE_KEY = "geofs-real-impact-settings";
 
@@ -60,8 +57,6 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const saved = JSON.parse(raw);
-      // Only copy over keys we actually know about, so old/corrupt
-      // saved data can't inject unexpected properties.
       Object.keys(DEFAULTS).forEach((key) => {
         if (key in saved) settings[key] = saved[key];
       });
@@ -78,7 +73,7 @@
     }
   }
 
-  loadSettings(); // apply any saved values immediately, before anything below uses "settings"
+  loadSettings();
 
   function getCesium() {
     return window.Cesium || (window.geofs?.api?.Cesium) || null;
@@ -125,69 +120,127 @@
     };
   }
 
-  // BUILDING detection via sampleHeight (this works because OSM/Google
-  // tilesets ARE real Cesium3DTileset objects, unlike GeoFS's native trees).
-  async function hasBuildingAtExactPosition(viewer, lat, lon, headingDeg) {
+  let fallbackWarned = false;
+
+  function sampleHeightAtAircraft(viewer, lat, lon, headingDeg) {
+    const Cesium = getCesium();
+    if (!Cesium || !viewer) return null;
+
+    const obj3d = window.geofs?.aircraft?.instance?.object3d;
+    const canHide = !!(obj3d && typeof obj3d.setVisibility === "function");
+
+    if (!canHide && !fallbackWarned) {
+      fallbackWarned = true;
+      console.warn("[Real Impact] object3d.setVisibility not available -- falling back to lateral-offset sampling.");
+    }
+
+    let sampleLat = lat, sampleLon = lon;
+    if (!canHide) {
+      const offset = offsetLatLon(lat, lon, headingDeg, settings.sampleOffsetM);
+      sampleLat = offset.lat;
+      sampleLon = offset.lon;
+    }
+
+    const carto = new Cesium.Cartographic(
+      Cesium.Math.toRadians(sampleLon),
+      Cesium.Math.toRadians(sampleLat)
+    );
+
+    let renderedHeight = null;
+    try {
+      if (canHide) obj3d.setVisibility(false);
+      renderedHeight = viewer.scene.sampleHeight(carto);
+    } catch (e) {
+      renderedHeight = null;
+    } finally {
+      if (canHide) obj3d.setVisibility(true);
+    }
+
+    if (renderedHeight == null) return null;
+    return { renderedHeight, sampleLat, sampleLon };
+  }
+
+  async function hasBuildingAtExactPosition(viewer, lat, lon, headingDeg, altM) {
     const Cesium = getCesium();
     if (!Cesium || !viewer) return false;
 
-    const offset = offsetLatLon(lat, lon, headingDeg, settings.sampleOffsetM);
-    const latRad = Cesium.Math.toRadians(offset.lat);
-    const lonRad = Cesium.Math.toRadians(offset.lon);
-    const carto = new Cesium.Cartographic(lonRad, latRad);
+    const sampled = sampleHeightAtAircraft(viewer, lat, lon, headingDeg);
+    if (!sampled) return false;
+    const { renderedHeight, sampleLat, sampleLon } = sampled;
 
-    let renderedHeight;
-    try {
-      renderedHeight = viewer.scene.sampleHeight(carto);
-    } catch (e) {
-      return false;
-    }
-    if (renderedHeight == null) return false;
+    const latRad = Cesium.Math.toRadians(sampleLat);
+    const lonRad = Cesium.Math.toRadians(sampleLon);
+    const carto = new Cesium.Cartographic(lonRad, latRad);
 
     let terrainHeight;
     try {
-      const tp = viewer.terrainProvider;
-      if (!tp?.ready || typeof Cesium.sampleTerrainMostDetailed !== "function") return false;
-      const sampled = await Cesium.sampleTerrainMostDetailed(tp, [new Cesium.Cartographic(lonRad, latRad)]);
-      terrainHeight = sampled?.[0]?.height;
+      terrainHeight = viewer.scene.globe.getHeight(carto);
     } catch (e) {
       return false;
     }
     if (terrainHeight == null || !Number.isFinite(terrainHeight)) return false;
 
-    return (renderedHeight - terrainHeight) >= settings.objectHeightThresholdM;
+    const diff = renderedHeight - terrainHeight;
+    const hasTallObject = diff >= settings.objectHeightThresholdM;
+
+    let clearance = null;
+    let withinVerticalRange = true;
+    if (typeof altM === "number" && Number.isFinite(altM)) {
+      clearance = altM - renderedHeight;
+      withinVerticalRange = clearance <= settings.buildingVerticalMarginM;
+    }
+
+    const isHit = hasTallObject && withinVerticalRange;
+
+    if (hasTallObject && settings.debugLogs) {
+      console.log(
+        `[Real Impact][DEBUG] raw building hit -- lat=${sampleLat.toFixed(6)} lon=${sampleLon.toFixed(6)} ` +
+        `renderedHeight=${renderedHeight.toFixed(2)}m terrainHeight=${terrainHeight.toFixed(2)}m diff=${diff.toFixed(2)}m ` +
+        `(threshold=${settings.objectHeightThresholdM}m) altM=${altM != null ? altM.toFixed(2) : "n/a"} ` +
+        `clearance=${clearance != null ? clearance.toFixed(2) + "m" : "n/a"} ` +
+        `(margin=${settings.buildingVerticalMarginM}m) -> ${isHit ? "CONFIRMED" : "too high above it, ignored"}`
+      );
+    }
+
+    return isHit;
   }
 
-  // FIX v2.2: TREE detection via the real tree position extractor
-  // (window.geofsRealTrees), since it was confirmed with three separate
-  // tests (sampleHeight, pick/drillPick, pickPosition with and without
-  // pickTranslucentDepth) that GeoFS's trees never write to any depth
-  // buffer Cesium can read -- they simply don't exist for any standard
-  // picking API. If the extractor script isn't installed or hasn't
-  // loaded any tiles yet, this just returns false without breaking
-  // anything (buildings still get detected fine via sampleHeight).
-  // FIX v2.3: do NOT apply the lateral offset here. That offset
-  // (sampleOffsetM) exists only for the sampleHeight-based building
-  // check, which without it would end up detecting the aircraft's own
-  // fuselage as an "object". isTreeNear() is a pure distance check
-  // against a list of real coordinates -- it doesn't have that
-  // self-detection problem, so applying the same offset only meant
-  // checking a point ~8m off to the side of where the aircraft
-  // actually is, producing heading-dependent results (sometimes the
-  // real tree fell outside the offset point, sometimes a different
-  // tree happened to land right on it by chance).
-  function hasTreeAtExactPosition(lat, lon) {
+  // FIX v3.4.1: Passes settings.treeCanopyHeightM to the cylinder-aware isTreeNear/findNearestTree,
+  // with STRICT universal altitude ceiling enforcement (never trigger if altFt > minAltitudeFt).
+  function hasTreeAtExactPosition(lat, lon, heightM, speedKts, altFt) {
     if (typeof window.geofsRealTrees?.isTreeNear !== "function") return false;
-    return window.geofsRealTrees.isTreeNear(lat, lon, settings.treeRadiusM);
-  }
 
-  async function hasObjectAtExactPosition(viewer, lat, lon, headingDeg) {
-    // Check trees first: it's synchronous and much cheaper than
-    // sampleHeight + sampleTerrainMostDetailed (which is async and hits
-    // the terrain provider). If there's already a tree, there's no need
-    // to wait on the async building check at all.
-    if (hasTreeAtExactPosition(lat, lon)) return true;
-    return await hasBuildingAtExactPosition(viewer, lat, lon, headingDeg);
+    // HARD UNIVERSAL CEILING: If the aircraft AGL altitude exceeds the configured threshold,
+    // it is mathematically impossible to hit a tree under any edge case.
+    if (typeof altFt === "number" && altFt > settings.minAltitudeFt) {
+      return false;
+    }
+
+    // Synchronize vertical canopy collision height: canopy collision height in meters
+    // is strictly capped by the user-configured altitude gate (converted from feet to meters).
+    const maxCanopyFromAltM = settings.minAltitudeFt * 0.3048;
+    const effectiveCanopyM = Math.min(settings.treeCanopyHeightM, maxCanopyFromAltM);
+
+    const hit = window.geofsRealTrees.isTreeNear(lat, lon, settings.treeRadiusM, heightM, effectiveCanopyM);
+    if (hit && settings.debugLogs) {
+      let matchInfo = "";
+      if (typeof window.geofsRealTrees?.findNearestTree === "function") {
+        const match = window.geofsRealTrees.findNearestTree(lat, lon, settings.treeRadiusM, heightM, effectiveCanopyM);
+        if (match) {
+          const horizStr = match.horizDistance != null ? ` horizDist=${match.horizDistance.toFixed(2)}m,` : "";
+          const relHStr = match.relHeight != null ? ` relHeight=${match.relHeight.toFixed(2)}m (canopy ${match.canopyHeight || effectiveCanopyM.toFixed(1)}m),` : "";
+          matchInfo = ` matchedTree{lat=${match.lat.toFixed(6)}, lon=${match.lon.toFixed(6)}, ` +
+            `baseAlt=${match.height.toFixed(2)}m,${horizStr}${relHStr} 3dDist=${match.distance.toFixed(2)}m, tile=${match.tileId}}`;
+        }
+      }
+      console.log(
+        `[Real Impact][DEBUG] 💥 cylinder tree hit -- lat=${lat.toFixed(6)} lon=${lon.toFixed(6)} ` +
+        `altM=${typeof heightM === "number" ? heightM.toFixed(2) : "n/a"} haglFt=${typeof altFt === "number" ? altFt.toFixed(1) : "n/a"} ` +
+        `radius=${settings.treeRadiusM}m canopy=${effectiveCanopyM.toFixed(1)}m ` +
+        `speed=${typeof speedKts === "number" ? speedKts.toFixed(1) + "kt" : "n/a"}${matchInfo}`
+      );
+    }
+    return hit;
   }
 
   // ============================================================
@@ -239,6 +292,7 @@
   // 4. Main loop
   // ============================================================
   let checkInFlight = false;
+  let consecutiveBuildingHits = 0;
 
   async function mainLoop() {
     if (!settings.enabled) return;
@@ -251,6 +305,7 @@
     if (lastCrashedState && !currentCrashed) {
       spawnGraceUntil = performance.now() + settings.spawnGraceMs;
       stopForcedFall();
+      consecutiveBuildingHits = 0;
     }
     lastCrashedState = currentCrashed;
 
@@ -263,24 +318,51 @@
 
     const altFt = values.haglFeet;
     const speedKts = values.kias || 0;
-    if (altFt == null || altFt > settings.minAltitudeFt) return;
+    if (altFt == null) return;
     if (speedKts < settings.minSpeedKts) return;
+
+    const treesArmed = altFt <= settings.minAltitudeFt;
+    const buildingsArmed = altFt <= settings.buildingMaxAltitudeFt;
+
+    // FIX v3.4.1: Strictly isolate tree checks to treesArmed.
+    // Never allow building altitude checks to accidentally keep tree collision active at high altitudes!
+    const treeCheckArmed = treesArmed;
+    if (!buildingsArmed) consecutiveBuildingHits = 0;
+    if (!treeCheckArmed && !buildingsArmed) return;
 
     const lla = instance.lastLlaLocation;
     if (!lla) return;
-    const [lat, lon] = lla;
+    const [lat, lon, altM] = lla;
     const headingDeg = values.heading || 0;
 
     checkInFlight = true;
     try {
-      const hit = await hasObjectAtExactPosition(viewer, lat, lon, headingDeg);
+      let hit = false;
+
+      if (treeCheckArmed && hasTreeAtExactPosition(lat, lon, altM, speedKts, altFt)) {
+        hit = true;
+      }
+
+      if (!hit && buildingsArmed && settings.buildingsEnabled) {
+        const buildingHit = await hasBuildingAtExactPosition(viewer, lat, lon, headingDeg, altM);
+        consecutiveBuildingHits = buildingHit ? consecutiveBuildingHits + 1 : 0;
+        hit = consecutiveBuildingHits >= settings.buildingConfirmChecks;
+      }
+
       if (hit) {
+        consecutiveBuildingHits = 0;
         lastCrashTime = performance.now();
         instance.crash();
         hookControlsForForcedFall();
         startForcedFall();
         showToast("💥 Impact against a real obstacle detected", true);
-        console.log("[Real Impact] Forced crash -- object confirmed at the exact position.");
+        const altStr = typeof altFt === "number" ? `${altFt.toFixed(0)}ft AGL` : "n/a";
+        const spdStr = typeof speedKts === "number" ? `${speedKts.toFixed(0)}kt` : "n/a";
+        console.log(
+          `%c[Real Impact]%c 💥 FORCED CRASH -- obstacle confirmed at lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)} (${altStr}, ${spdStr})`,
+          "color:#ef4444;font-weight:bold;",
+          "color:#fca5a5;"
+        );
       }
     } finally {
       checkInFlight = false;
@@ -288,7 +370,7 @@
   }
 
   // ============================================================
-  // 5. Own console (] key)
+  // 5. Console Panel (] key)
   // ============================================================
   function showPanel() {
     if (panel) { panel.remove(); panel = null; return; }
@@ -299,7 +381,7 @@
         position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
         background: rgba(20,10,10,0.92); backdrop-filter: blur(12px);
         padding: 18px; border-radius: 14px; z-index: 100000;
-        min-width: 300px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        min-width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
         border: 1px solid rgba(255,80,80,0.25);
         font-family: 'Segoe UI', sans-serif; color: #fff;
       }
@@ -324,30 +406,53 @@
     panel = document.createElement("div");
     panel.id = "cur-panel";
     const treesStatus = typeof window.geofsRealTrees?.isTreeNear === "function"
-      ? "✅ Tree extractor connected"
+      ? "✅ Tree extractor connected (Cylinder Mode)"
       : "⚠️ Tree extractor NOT detected (only buildings are active)";
     panel.innerHTML = `
-      <div class="title">💥 GeoFS Real Impact v2.4</div>
-      <label>Max altitude to count as impact (ft, above bare terrain) <span class="val" id="cur-a-val">${settings.minAltitudeFt}</span></label>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:8px;">
+        <div class="title" style="margin:0; text-align:left; font-size:15px;">💥 GeoFS Real Impact v3.4.2</div>
+        <button id="cur-close-x" style="width:26px; height:26px; margin:0; padding:0; line-height:24px; background:rgba(255,255,255,0.12); hover:bg:rgba(255,255,255,0.25); border:1px solid rgba(255,255,255,0.25); border-radius:6px; color:#fff; font-size:15px; cursor:pointer; font-weight:bold; display:flex; align-items:center; justify-content:center;" title="Cerrar panel (] o clic)">✕</button>
+      </div>
+      <label>Max tree impact gate (ft, above ground) <span class="val" id="cur-a-val">${settings.minAltitudeFt}</span></label>
       <input type="range" id="cur-alt" min="15" max="300" step="5" value="${settings.minAltitudeFt}">
-      <label>Min speed to arm the crash check (kts) <span class="val" id="cur-s-val">${settings.minSpeedKts}</span></label>
+      <label>Max building impact gate (ft, above ground) <span class="val" id="cur-b-val">${settings.buildingMaxAltitudeFt}</span></label>
+      <input type="range" id="cur-balt" min="200" max="3500" step="50" value="${settings.buildingMaxAltitudeFt}">
+      <label>Min speed to arm crash check (kts) <span class="val" id="cur-s-val">${settings.minSpeedKts}</span></label>
       <input type="range" id="cur-speed" min="0" max="60" step="1" value="${settings.minSpeedKts}">
-      <label>Object height threshold -- buildings (m) <span class="val" id="cur-h-val">${settings.objectHeightThresholdM}</span></label>
-      <input type="range" id="cur-height" min="0.5" max="10" step="0.5" value="${settings.objectHeightThresholdM}">
-      <label>Tree detection radius (m) <span class="val" id="cur-t-val">${settings.treeRadiusM}</span></label>
+      <label>Tree canopy collision height (m) <span class="val" id="cur-th-val">${settings.treeCanopyHeightM}</span></label>
+      <input type="range" id="cur-treeheight" min="10" max="50" step="1" value="${settings.treeCanopyHeightM}">
+      <label>Tree horizontal radius (m) <span class="val" id="cur-t-val">${settings.treeRadiusM}</span></label>
       <input type="range" id="cur-tree" min="2" max="20" step="0.5" value="${settings.treeRadiusM}">
-      <label>Sampling offset (m) <span class="val" id="cur-o-val">${settings.sampleOffsetM}</span></label>
-      <input type="range" id="cur-offset" min="2" max="20" step="1" value="${settings.sampleOffsetM}">
+      <label>Building height threshold (m) <span class="val" id="cur-h-val">${settings.objectHeightThresholdM}</span></label>
+      <input type="range" id="cur-height" min="0.5" max="10" step="0.5" value="${settings.objectHeightThresholdM}">
+      <label>Building vertical clearance margin (m) <span class="val" id="cur-v-val">${settings.buildingVerticalMarginM}</span></label>
+      <input type="range" id="cur-vmargin" min="1" max="30" step="1" value="${settings.buildingVerticalMarginM}">
+      <label>Building confirmation passes <span class="val" id="cur-c-val">${settings.buildingConfirmChecks}</span></label>
+      <input type="range" id="cur-confirm" min="1" max="5" step="1" value="${settings.buildingConfirmChecks}">
       <button class="toggle-btn" id="cur-toggle">${settings.enabled ? "Disable" : "Enable"}</button>
+      <button class="reset-btn" id="cur-bldg-toggle">${settings.buildingsEnabled ? "Disable buildings only" : "Enable buildings only"}</button>
+      <button class="reset-btn" id="cur-debug-toggle">Console: ${settings.debugLogs ? "Verbose (Debug)" : "Quiet (Clean)"}</button>
       <button class="reset-btn" id="cur-reset">Force end of fall mode (debug)</button>
       <button class="defaults-btn" id="cur-defaults">↺ Restore default values</button>
+      <button id="cur-close-bottom" style="background:#2d1515; color:#ff9999; border:1px solid rgba(255,80,80,0.35); font-size:12px; margin-top:10px;">✕ Cerrar Panel (o tecla ])</button>
       <div class="status-line">${treesStatus}</div>
     `;
     document.body.appendChild(panel);
 
+    panel.querySelector("#cur-debug-toggle").onclick = function () {
+      settings.debugLogs = !settings.debugLogs;
+      this.textContent = `Console: ${settings.debugLogs ? "Verbose (Debug)" : "Quiet (Clean)"}`;
+      saveSettings();
+    };
+
     panel.querySelector("#cur-alt").oninput = function () {
       settings.minAltitudeFt = parseFloat(this.value);
       panel.querySelector("#cur-a-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-balt").oninput = function () {
+      settings.buildingMaxAltitudeFt = parseFloat(this.value);
+      panel.querySelector("#cur-b-val").textContent = this.value;
       saveSettings();
     };
     panel.querySelector("#cur-speed").oninput = function () {
@@ -355,9 +460,9 @@
       panel.querySelector("#cur-s-val").textContent = this.value;
       saveSettings();
     };
-    panel.querySelector("#cur-height").oninput = function () {
-      settings.objectHeightThresholdM = parseFloat(this.value);
-      panel.querySelector("#cur-h-val").textContent = this.value;
+    panel.querySelector("#cur-treeheight").oninput = function () {
+      settings.treeCanopyHeightM = parseFloat(this.value);
+      panel.querySelector("#cur-th-val").textContent = this.value;
       saveSettings();
     };
     panel.querySelector("#cur-tree").oninput = function () {
@@ -365,9 +470,19 @@
       panel.querySelector("#cur-t-val").textContent = this.value;
       saveSettings();
     };
-    panel.querySelector("#cur-offset").oninput = function () {
-      settings.sampleOffsetM = parseFloat(this.value);
-      panel.querySelector("#cur-o-val").textContent = this.value;
+    panel.querySelector("#cur-height").oninput = function () {
+      settings.objectHeightThresholdM = parseFloat(this.value);
+      panel.querySelector("#cur-h-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-vmargin").oninput = function () {
+      settings.buildingVerticalMarginM = parseFloat(this.value);
+      panel.querySelector("#cur-v-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-confirm").oninput = function () {
+      settings.buildingConfirmChecks = parseFloat(this.value);
+      panel.querySelector("#cur-c-val").textContent = this.value;
       saveSettings();
     };
     panel.querySelector("#cur-toggle").onclick = function () {
@@ -375,15 +490,27 @@
       this.textContent = settings.enabled ? "Disable" : "Enable";
       saveSettings();
     };
+    panel.querySelector("#cur-bldg-toggle").onclick = function () {
+      settings.buildingsEnabled = !settings.buildingsEnabled;
+      this.textContent = settings.buildingsEnabled ? "Disable buildings only" : "Enable buildings only";
+      saveSettings();
+    };
     panel.querySelector("#cur-reset").onclick = stopForcedFall;
     panel.querySelector("#cur-defaults").onclick = function () {
       Object.assign(settings, DEFAULTS);
       saveSettings();
-      console.log("↺ [Real Impact] Values restored to defaults.");
       panel.remove();
       panel = null;
       showPanel();
     };
+    function closePanel() {
+      if (panel) {
+        panel.remove();
+        panel = null;
+      }
+    }
+    panel.querySelector("#cur-close-x").onclick = closePanel;
+    panel.querySelector("#cur-close-bottom").onclick = closePanel;
   }
 
   document.addEventListener("keydown", (e) => {
@@ -392,6 +519,17 @@
       showPanel();
     }
   });
+
+  window.realImpact = {
+    settings,
+    setDebug: (enabled) => {
+      settings.debugLogs = !!enabled;
+      saveSettings();
+      console.log(`[Real Impact] Debug logs: ${settings.debugLogs ? "ON (verbose)" : "OFF (quiet)"}`);
+    },
+    stopForcedFall,
+    showPanel
+  };
 
   // ============================================================
   // 6. Initialization
@@ -409,7 +547,11 @@
 
     setInterval(mainLoop, 200);
     const treesReady = typeof window.geofsRealTrees?.isTreeNear === "function";
-    console.log(`[Real Impact] 💥 v2.4 ready. Tree detection: ${treesReady ? "active" : "NOT available (install GeoFS Real Tree Positions Extractor)"}. Press ] to open the console.`);
+    console.log(
+      `%c[Real Impact]%c 💥 v3.4.2 ready · Trees: ${treesReady ? "CYLINDER (gate: " + settings.minAltitudeFt + "ft, canopy: " + settings.treeCanopyHeightM + "m)" : "NOT detected"} · Press ] for Settings`,
+      "color:#f43f5e;font-weight:bold;",
+      "color:#94a3b8;"
+    );
   }
 
   let attempts = 0;
